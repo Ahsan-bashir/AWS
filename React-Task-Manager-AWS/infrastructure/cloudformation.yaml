@@ -1,0 +1,505 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'Task Manager - Complete CRUD Application Infrastructure'
+
+Parameters:
+  Environment:
+    Type: String
+    Default: 'dev'
+    AllowedValues: ['dev', 'staging', 'prod']
+    Description: 'Environment name'
+  
+  CorsOrigin:
+    Type: String
+    Default: '*'
+    Description: 'CORS origin for API Gateway'
+
+Resources:
+  # DynamoDB Table
+  TasksTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      TableName: !Sub '${Environment}-tasks-table'
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+        - AttributeName: status
+          AttributeType: S
+        - AttributeName: createdAt
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+      GlobalSecondaryIndexes:
+        - IndexName: status-createdAt-index
+          KeySchema:
+            - AttributeName: status
+              KeyType: HASH
+            - AttributeName: createdAt
+              KeyType: RANGE
+          Projection:
+            ProjectionType: ALL
+      StreamSpecification:
+        StreamViewType: NEW_AND_OLD_IMAGES
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+        - Key: Application
+          Value: TaskManager
+
+  # IAM Role for Lambda Functions
+  LambdaExecutionRole:
+    Type: AWS::IAM::Role
+    Properties:
+      RoleName: !Sub '${Environment}-task-manager-lambda-role'
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: DynamoDBAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - dynamodb:PutItem
+                  - dynamodb:GetItem
+                  - dynamodb:UpdateItem
+                  - dynamodb:DeleteItem
+                  - dynamodb:Scan
+                  - dynamodb:Query
+                Resource: 
+                  - !GetAtt TasksTable.Arn
+                  - !Sub '${TasksTable.Arn}/index/*'
+
+  # Lambda Function - Submitter (Create Tasks)
+  SubmitterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-task-submitter'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const { v4: uuidv4 } = require('uuid');
+          
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              const corsHeaders = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                  'Access-Control-Allow-Methods': 'POST,OPTIONS'
+              };
+              
+              if (event.httpMethod === 'OPTIONS') {
+                  return { statusCode: 200, headers: corsHeaders, body: '{}' };
+              }
+              
+              try {
+                  const { userName, task } = JSON.parse(event.body);
+                  
+                  if (!userName || !task) {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({ error: 'Missing required fields' })
+                      };
+                  }
+                  
+                  const taskItem = {
+                      id: uuidv4(),
+                      userName: userName.trim(),
+                      task: task.trim(),
+                      status: 'active',
+                      createdAt: new Date().toISOString(),
+                      updatedAt: new Date().toISOString()
+                  };
+                  
+                  await dynamodb.put({
+                      TableName: process.env.TASKS_TABLE,
+                      Item: taskItem
+                  }).promise();
+                  
+                  return {
+                      statusCode: 201,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ message: 'Task created', task: taskItem })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ error: 'Internal server error' })
+                  };
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function - Fetcher (Get Tasks)
+  FetcherFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-task-fetcher'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              const corsHeaders = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                  'Access-Control-Allow-Methods': 'GET,OPTIONS'
+              };
+              
+              if (event.httpMethod === 'OPTIONS') {
+                  return { statusCode: 200, headers: corsHeaders, body: '{}' };
+              }
+              
+              try {
+                  const result = await dynamodb.scan({
+                      TableName: process.env.TASKS_TABLE
+                  }).promise();
+                  
+                  const sortedTasks = result.Items.sort((a, b) => 
+                      new Date(b.createdAt) - new Date(a.createdAt)
+                  );
+                  
+                  return {
+                      statusCode: 200,
+                      headers: corsHeaders,
+                      body: JSON.stringify({
+                          tasks: sortedTasks,
+                          count: sortedTasks.length
+                      })
+                  };
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ error: 'Internal server error' })
+                  };
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # Lambda Function - Admin (Update/Delete Tasks)
+  AdminFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${Environment}-task-admin'
+      Runtime: nodejs18.x
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Timeout: 30
+      MemorySize: 256
+      Environment:
+        Variables:
+          TASKS_TABLE: !Ref TasksTable
+          ENVIRONMENT: !Ref Environment
+      Code:
+        ZipFile: |
+          const AWS = require('aws-sdk');
+          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          
+          exports.handler = async (event) => {
+              const corsHeaders = {
+                  'Access-Control-Allow-Origin': '*',
+                  'Access-Control-Allow-Headers': 'Content-Type,Authorization',
+                  'Access-Control-Allow-Methods': 'PUT,DELETE,OPTIONS'
+              };
+              
+              if (event.httpMethod === 'OPTIONS') {
+                  return { statusCode: 200, headers: corsHeaders, body: '{}' };
+              }
+              
+              try {
+                  const taskId = event.pathParameters?.id;
+                  if (!taskId) {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({ error: 'Missing task ID' })
+                      };
+                  }
+                  
+                  if (event.httpMethod === 'PUT') {
+                      const { status } = JSON.parse(event.body);
+                      if (status !== 'active' && status !== 'inactive') {
+                          return {
+                              statusCode: 400,
+                              headers: corsHeaders,
+                              body: JSON.stringify({ error: 'Invalid status' })
+                          };
+                      }
+                      
+                      const result = await dynamodb.update({
+                          TableName: process.env.TASKS_TABLE,
+                          Key: { id: taskId },
+                          UpdateExpression: 'SET #status = :status, #updatedAt = :updatedAt',
+                          ExpressionAttributeNames: { '#status': 'status', '#updatedAt': 'updatedAt' },
+                          ExpressionAttributeValues: { ':status': status, ':updatedAt': new Date().toISOString() },
+                          ReturnValues: 'ALL_NEW'
+                      }).promise();
+                      
+                      return {
+                          statusCode: 200,
+                          headers: corsHeaders,
+                          body: JSON.stringify({ message: 'Task updated', task: result.Attributes })
+                      };
+                  } else if (event.httpMethod === 'DELETE') {
+                      await dynamodb.delete({
+                          TableName: process.env.TASKS_TABLE,
+                          Key: { id: taskId }
+                      }).promise();
+                      
+                      return {
+                          statusCode: 200,
+                          headers: corsHeaders,
+                          body: JSON.stringify({ message: 'Task deleted' })
+                      };
+                  }
+              } catch (error) {
+                  console.error('Error:', error);
+                  return {
+                      statusCode: 500,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ error: 'Internal server error' })
+                  };
+              }
+          };
+      Tags:
+        - Key: Environment
+          Value: !Ref Environment
+
+  # API Gateway Rest API
+  TaskManagerAPI:
+    Type: AWS::ApiGateway::RestApi
+    Properties:
+      Name: !Sub '${Environment}-task-manager-api'
+      Description: 'Task Manager CRUD API'
+      EndpointConfiguration:
+        Types:
+          - REGIONAL
+      
+  # API Gateway Resources and Methods
+  TasksResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ParentId: !GetAtt TaskManagerAPI.RootResourceId
+      PathPart: 'tasks'
+
+  TaskResource:
+    Type: AWS::ApiGateway::Resource
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ParentId: !Ref TasksResource
+      PathPart: '{id}'
+
+  # POST /tasks (Create task)
+  PostTasksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ResourceId: !Ref TasksResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${SubmitterFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # GET /tasks (Fetch tasks)
+  GetTasksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ResourceId: !Ref TasksResource
+      HttpMethod: GET
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${FetcherFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # PUT /tasks/{id} (Update task)
+  PutTaskMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ResourceId: !Ref TaskResource
+      HttpMethod: PUT
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # DELETE /tasks/{id} (Delete task)
+  DeleteTaskMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ResourceId: !Ref TaskResource
+      HttpMethod: DELETE
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${AdminFunction.Arn}/invocations'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+
+  # CORS Options methods
+  OptionsTasksMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ResourceId: !Ref TasksResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'GET,POST,OPTIONS'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Headers: true
+            Access-Control-Allow-Methods: true
+
+  OptionsTaskMethod:
+    Type: AWS::ApiGateway::Method
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      ResourceId: !Ref TaskResource
+      HttpMethod: OPTIONS
+      AuthorizationType: NONE
+      Integration:
+        Type: MOCK
+        IntegrationResponses:
+          - StatusCode: 200
+            ResponseParameters:
+              method.response.header.Access-Control-Allow-Origin: "'*'"
+              method.response.header.Access-Control-Allow-Headers: "'Content-Type,Authorization'"
+              method.response.header.Access-Control-Allow-Methods: "'PUT,DELETE,OPTIONS'"
+        RequestTemplates:
+          application/json: '{"statusCode": 200}'
+      MethodResponses:
+        - StatusCode: 200
+          ResponseHeaders:
+            Access-Control-Allow-Origin: true
+            Access-Control-Allow-Headers: true
+            Access-Control-Allow-Methods: true
+
+  # Lambda Permissions
+  SubmitterLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref SubmitterFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TaskManagerAPI}/*/*'
+
+  FetcherLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref FetcherFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TaskManagerAPI}/*/*'
+
+  AdminLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref AdminFunction
+      Action: lambda:InvokeFunction
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TaskManagerAPI}/*/*'
+
+  # API Gateway Deployment
+  ApiDeployment:
+    Type: AWS::ApiGateway::Deployment
+    DependsOn:
+      - PostTasksMethod
+      - GetTasksMethod
+      - PutTaskMethod
+      - DeleteTaskMethod
+      - OptionsTasksMethod
+      - OptionsTaskMethod
+    Properties:
+      RestApiId: !Ref TaskManagerAPI
+      StageName: !Ref Environment
+
+Outputs:
+  ApiEndpoint:
+    Description: 'API Gateway endpoint URL'
+    Value: !Sub 'https://${TaskManagerAPI}.execute-api.${AWS::Region}.amazonaws.com/${Environment}'
+    Export:
+      Name: !Sub '${AWS::StackName}-ApiEndpoint'
+
+  TasksTableName:
+    Description: 'DynamoDB Tasks Table Name'
+    Value: !Ref TasksTable
+    Export:
+      Name: !Sub '${AWS::StackName}-TasksTable'
+
+  TasksTableArn:
+    Description: 'DynamoDB Tasks Table ARN'
+    Value: !GetAtt TasksTable.Arn
+    Export:
+      Name: !Sub '${AWS::StackName}-TasksTableArn'
