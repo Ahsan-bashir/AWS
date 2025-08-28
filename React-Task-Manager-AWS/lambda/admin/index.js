@@ -1,7 +1,11 @@
-const AWS = require('aws-sdk');
+// Replace your lambda/admin/index.js with this code
+
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, GetCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
 
 // Initialize DynamoDB client
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+const client = new DynamoDBClient({});
+const dynamodb = DynamoDBDocumentClient.from(client);
 
 exports.handler = async (event) => {
     console.log('Event:', JSON.stringify(event, null, 2));
@@ -36,7 +40,7 @@ exports.handler = async (event) => {
             };
         }
         
-        // DynamoDB table name (replace with your actual table name)
+        // DynamoDB table name
         const tableName = process.env.TASKS_TABLE || 'TasksTable';
         
         // Handle different HTTP methods
@@ -103,12 +107,12 @@ async function updateTaskStatus(tableName, taskId, requestBody, corsHeaders) {
         }
         
         // First, check if the task exists
-        const getParams = {
+        const getCommand = new GetCommand({
             TableName: tableName,
             Key: { id: taskId }
-        };
+        });
         
-        const existingItem = await dynamodb.get(getParams).promise();
+        const existingItem = await dynamodb.send(getCommand);
         
         if (!existingItem.Item) {
             return {
@@ -122,7 +126,7 @@ async function updateTaskStatus(tableName, taskId, requestBody, corsHeaders) {
         }
         
         // Update the task status
-        const updateParams = {
+        const updateCommand = new UpdateCommand({
             TableName: tableName,
             Key: { id: taskId },
             UpdateExpression: 'SET #status = :status, #updatedAt = :updatedAt',
@@ -135,9 +139,9 @@ async function updateTaskStatus(tableName, taskId, requestBody, corsHeaders) {
                 ':updatedAt': new Date().toISOString()
             },
             ReturnValues: 'ALL_NEW'
-        };
+        });
         
-        const result = await dynamodb.update(updateParams).promise();
+        const result = await dynamodb.send(updateCommand);
         
         console.log(`Task ${taskId} status updated to ${status}`);
         
@@ -153,14 +157,14 @@ async function updateTaskStatus(tableName, taskId, requestBody, corsHeaders) {
     } catch (error) {
         console.error('Error updating task status:', error);
         
-        if (error.code) {
+        if (error.name) {
             return {
                 statusCode: 500,
                 headers: corsHeaders,
                 body: JSON.stringify({
                     error: 'AWS Service Error',
                     message: error.message,
-                    code: error.code
+                    code: error.name
                 })
             };
         }
@@ -180,12 +184,12 @@ async function updateTaskStatus(tableName, taskId, requestBody, corsHeaders) {
 async function deleteTask(tableName, taskId, corsHeaders) {
     try {
         // First, check if the task exists
-        const getParams = {
+        const getCommand = new GetCommand({
             TableName: tableName,
             Key: { id: taskId }
-        };
+        });
         
-        const existingItem = await dynamodb.get(getParams).promise();
+        const existingItem = await dynamodb.send(getCommand);
         
         if (!existingItem.Item) {
             return {
@@ -199,13 +203,13 @@ async function deleteTask(tableName, taskId, corsHeaders) {
         }
         
         // Delete the task
-        const deleteParams = {
+        const deleteCommand = new DeleteCommand({
             TableName: tableName,
             Key: { id: taskId },
             ReturnValues: 'ALL_OLD'
-        };
+        });
         
-        const result = await dynamodb.delete(deleteParams).promise();
+        const result = await dynamodb.send(deleteCommand);
         
         console.log(`Task ${taskId} deleted successfully`);
         
@@ -221,14 +225,14 @@ async function deleteTask(tableName, taskId, corsHeaders) {
     } catch (error) {
         console.error('Error deleting task:', error);
         
-        if (error.code) {
+        if (error.name) {
             return {
                 statusCode: 500,
                 headers: corsHeaders,
                 body: JSON.stringify({
                     error: 'AWS Service Error',
                     message: error.message,
-                    code: error.code
+                    code: error.name
                 })
             };
         }

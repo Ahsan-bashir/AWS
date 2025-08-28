@@ -1,11 +1,18 @@
-const AWS = require('aws-sdk');
-const { v4: uuidv4 } = require('uuid');
+// Replace your lambda/submitter/index.js with this code
+
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+const { randomUUID } = require('crypto');
 
 // Initialize DynamoDB client
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+const client = new DynamoDBClient({});
+const dynamodb = DynamoDBDocumentClient.from(client);
 
 exports.handler = async (event) => {
     console.log('Event:', JSON.stringify(event, null, 2));
+    console.log('Event body type:', typeof event.body);
+    console.log('Event body value:', event.body);
+    console.log('Event isBase64Encoded:', event.isBase64Encoded);
     
     // CORS headers
     const corsHeaders = {
@@ -26,10 +33,30 @@ exports.handler = async (event) => {
     try {
         // Parse request body
         let requestBody;
+        
+        // Check if body exists
+        if (!event.body) {
+            console.error('No request body found');
+            return {
+                statusCode: 400,
+                headers: corsHeaders,
+                body: JSON.stringify({
+                    error: 'Missing request body',
+                    message: 'Request body is required'
+                })
+            };
+        }
+        
         try {
-            requestBody = JSON.parse(event.body);
+            // Handle base64 encoded body (if coming from API Gateway)
+            const bodyString = event.isBase64Encoded ? 
+                Buffer.from(event.body, 'base64').toString('utf-8') : 
+                event.body;
+            
+            requestBody = JSON.parse(bodyString);
         } catch (parseError) {
             console.error('Error parsing request body:', parseError);
+            console.error('Raw body:', event.body);
             return {
                 statusCode: 400,
                 headers: corsHeaders,
@@ -79,7 +106,7 @@ exports.handler = async (event) => {
         
         // Create task item
         const taskItem = {
-            id: uuidv4(),
+            id: randomUUID(),
             userName: userName.trim(),
             task: task.trim(),
             status: 'active',
@@ -87,18 +114,17 @@ exports.handler = async (event) => {
             updatedAt: new Date().toISOString()
         };
         
-        // DynamoDB table name (replace with your actual table name)
+        // DynamoDB table name
         const tableName = process.env.TASKS_TABLE || 'TasksTable';
         
         // Insert item into DynamoDB
-        const putParams = {
+        const command = new PutCommand({
             TableName: tableName,
             Item: taskItem,
-            // Prevent overwriting if item with same id already exists
             ConditionExpression: 'attribute_not_exists(id)'
-        };
+        });
         
-        await dynamodb.put(putParams).promise();
+        await dynamodb.send(command);
         
         console.log('Task created successfully:', taskItem);
         
@@ -116,7 +142,7 @@ exports.handler = async (event) => {
         console.error('Error in submitter function:', error);
         
         // Handle DynamoDB conditional check failed error
-        if (error.code === 'ConditionalCheckFailedException') {
+        if (error.name === 'ConditionalCheckFailedException') {
             return {
                 statusCode: 409,
                 headers: corsHeaders,
@@ -128,14 +154,14 @@ exports.handler = async (event) => {
         }
         
         // Handle other AWS errors
-        if (error.code) {
+        if (error.name) {
             return {
                 statusCode: 500,
                 headers: corsHeaders,
                 body: JSON.stringify({
                     error: 'AWS Service Error',
                     message: error.message,
-                    code: error.code
+                    code: error.name
                 })
             };
         }

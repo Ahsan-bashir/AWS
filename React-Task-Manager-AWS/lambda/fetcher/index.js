@@ -1,7 +1,11 @@
-const AWS = require('aws-sdk');
+// Replace your lambda/fetcher/index.js with this code
+
+const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+const { DynamoDBDocumentClient, ScanCommand } = require('@aws-sdk/lib-dynamodb');
 
 // Initialize DynamoDB client
-const dynamodb = new AWS.DynamoDB.DocumentClient();
+const client = new DynamoDBClient({});
+const dynamodb = DynamoDBDocumentClient.from(client);
 
 exports.handler = async (event) => {
     console.log('Event:', JSON.stringify(event, null, 2));
@@ -23,7 +27,7 @@ exports.handler = async (event) => {
     }
     
     try {
-        // DynamoDB table name (replace with your actual table name)
+        // DynamoDB table name
         const tableName = process.env.TASKS_TABLE || 'TasksTable';
         
         // Get query parameters
@@ -85,7 +89,8 @@ exports.handler = async (event) => {
         console.log('Scan parameters:', JSON.stringify(scanParams, null, 2));
         
         // Perform the scan operation
-        const result = await dynamodb.scan(scanParams).promise();
+        const command = new ScanCommand(scanParams);
+        const result = await dynamodb.send(command);
         
         console.log(`Retrieved ${result.Items.length} tasks`);
         
@@ -122,7 +127,7 @@ exports.handler = async (event) => {
         console.error('Error in fetcher function:', error);
         
         // Handle AWS service errors
-        if (error.code === 'ResourceNotFoundException') {
+        if (error.name === 'ResourceNotFoundException') {
             return {
                 statusCode: 404,
                 headers: corsHeaders,
@@ -133,7 +138,7 @@ exports.handler = async (event) => {
             };
         }
         
-        if (error.code === 'ValidationException') {
+        if (error.name === 'ValidationException') {
             return {
                 statusCode: 400,
                 headers: corsHeaders,
@@ -145,14 +150,14 @@ exports.handler = async (event) => {
         }
         
         // Handle other AWS errors
-        if (error.code) {
+        if (error.name) {
             return {
                 statusCode: 500,
                 headers: corsHeaders,
                 body: JSON.stringify({
                     error: 'AWS Service Error',
                     message: error.message,
-                    code: error.code
+                    code: error.name
                 })
             };
         }
