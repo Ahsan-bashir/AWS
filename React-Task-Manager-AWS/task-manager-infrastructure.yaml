@@ -73,7 +73,7 @@ Resources:
                   - !GetAtt TasksTable.Arn
                   - !Sub '${TasksTable.Arn}/index/*'
 
-  # Lambda Functions with updated runtimes
+  # Lambda Functions with updated code
   SubmitterFunction:
     Type: AWS::Lambda::Function
     Properties:
@@ -89,50 +89,180 @@ Resources:
           ENVIRONMENT: !Ref Environment
       Code:
         ZipFile: |
-          const AWS = require('aws-sdk');
-          const { v4: uuidv4 } = require('uuid');
-          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, PutCommand } = require('@aws-sdk/lib-dynamodb');
+          const { randomUUID } = require('crypto');
+
+          // Initialize DynamoDB client
+          const client = new DynamoDBClient({});
+          const dynamodb = DynamoDBDocumentClient.from(client);
+
           exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              console.log('Event body type:', typeof event.body);
+              console.log('Event body value:', event.body);
+              console.log('Event isBase64Encoded:', event.isBase64Encoded);
+              
+              // CORS headers
               const corsHeaders = {
                   'Access-Control-Allow-Origin': '*',
                   'Access-Control-Allow-Headers': 'Content-Type,Authorization',
                   'Access-Control-Allow-Methods': 'POST,OPTIONS'
               };
+              
+              // Handle preflight OPTIONS request
               if (event.httpMethod === 'OPTIONS') {
-                  return { statusCode: 200, headers: corsHeaders, body: '{}' };
+                  return {
+                      statusCode: 200,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ message: 'CORS preflight handled' })
+                  };
               }
+              
               try {
-                  const { userName, task } = JSON.parse(event.body);
+                  // Parse request body
+                  let requestBody;
+                  
+                  // Check if body exists
+                  if (!event.body) {
+                      console.error('No request body found');
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Missing request body',
+                              message: 'Request body is required'
+                          })
+                      };
+                  }
+                  
+                  try {
+                      // Handle base64 encoded body (if coming from API Gateway)
+                      const bodyString = event.isBase64Encoded ? 
+                          Buffer.from(event.body, 'base64').toString('utf-8') : 
+                          event.body;
+                      
+                      requestBody = JSON.parse(bodyString);
+                  } catch (parseError) {
+                      console.error('Error parsing request body:', parseError);
+                      console.error('Raw body:', event.body);
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Invalid JSON in request body',
+                              message: parseError.message
+                          })
+                      };
+                  }
+                  
+                  // Validate required fields
+                  const { userName, task } = requestBody;
+                  
                   if (!userName || !task) {
                       return {
                           statusCode: 400,
                           headers: corsHeaders,
-                          body: JSON.stringify({ error: 'Missing required fields' })
+                          body: JSON.stringify({
+                              error: 'Missing required fields',
+                              message: 'userName and task are required'
+                          })
                       };
                   }
+                  
+                  // Validate field lengths
+                  if (userName.length > 100) {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Validation error',
+                              message: 'userName must be less than 100 characters'
+                          })
+                      };
+                  }
+                  
+                  if (task.length > 500) {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Validation error',
+                              message: 'task must be less than 500 characters'
+                          })
+                      };
+                  }
+                  
+                  // Create task item
                   const taskItem = {
-                      id: uuidv4(),
+                      id: randomUUID(),
                       userName: userName.trim(),
                       task: task.trim(),
                       status: 'active',
                       createdAt: new Date().toISOString(),
                       updatedAt: new Date().toISOString()
                   };
-                  await dynamodb.put({
-                      TableName: process.env.TASKS_TABLE,
-                      Item: taskItem
-                  }).promise();
+                  
+                  // DynamoDB table name
+                  const tableName = process.env.TASKS_TABLE || 'TasksTable';
+                  
+                  // Insert item into DynamoDB
+                  const command = new PutCommand({
+                      TableName: tableName,
+                      Item: taskItem,
+                      ConditionExpression: 'attribute_not_exists(id)'
+                  });
+                  
+                  await dynamodb.send(command);
+                  
+                  console.log('Task created successfully:', taskItem);
+                  
+                  // Return success response
                   return {
                       statusCode: 201,
                       headers: corsHeaders,
-                      body: JSON.stringify({ message: 'Task created', task: taskItem })
+                      body: JSON.stringify({
+                          message: 'Task created successfully',
+                          task: taskItem
+                      })
                   };
+                  
               } catch (error) {
-                  console.error('Error:', error);
+                  console.error('Error in submitter function:', error);
+                  
+                  // Handle DynamoDB conditional check failed error
+                  if (error.name === 'ConditionalCheckFailedException') {
+                      return {
+                          statusCode: 409,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Conflict',
+                              message: 'Task with this ID already exists'
+                          })
+                      };
+                  }
+                  
+                  // Handle other AWS errors
+                  if (error.name) {
+                      return {
+                          statusCode: 500,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'AWS Service Error',
+                              message: error.message,
+                              code: error.name
+                          })
+                      };
+                  }
+                  
+                  // Handle general errors
                   return {
                       statusCode: 500,
                       headers: corsHeaders,
-                      body: JSON.stringify({ error: 'Internal server error' })
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: 'Failed to create task'
+                      })
                   };
               }
           };
@@ -155,38 +285,176 @@ Resources:
           ENVIRONMENT: !Ref Environment
       Code:
         ZipFile: |
-          const AWS = require('aws-sdk');
-          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, ScanCommand } = require('@aws-sdk/lib-dynamodb');
+
+          // Initialize DynamoDB client
+          const client = new DynamoDBClient({});
+          const dynamodb = DynamoDBDocumentClient.from(client);
+
           exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              // CORS headers
               const corsHeaders = {
                   'Access-Control-Allow-Origin': '*',
                   'Access-Control-Allow-Headers': 'Content-Type,Authorization',
                   'Access-Control-Allow-Methods': 'GET,OPTIONS'
               };
+              
+              // Handle preflight OPTIONS request
               if (event.httpMethod === 'OPTIONS') {
-                  return { statusCode: 200, headers: corsHeaders, body: '{}' };
+                  return {
+                      statusCode: 200,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ message: 'CORS preflight handled' })
+                  };
               }
+              
               try {
-                  const result = await dynamodb.scan({
-                      TableName: process.env.TASKS_TABLE
-                  }).promise();
-                  const sortedTasks = result.Items.sort((a, b) =>
+                  // DynamoDB table name
+                  const tableName = process.env.TASKS_TABLE || 'TasksTable';
+                  
+                  // Get query parameters
+                  const queryParams = event.queryStringParameters || {};
+                  const {
+                      status,           // Filter by status: 'active' or 'inactive'
+                      userName,         // Filter by userName
+                      limit = '50',     // Limit number of results
+                      lastKey          // For pagination
+                  } = queryParams;
+                  
+                  // Build scan parameters
+                  let scanParams = {
+                      TableName: tableName,
+                      Limit: parseInt(limit, 10)
+                  };
+                  
+                  // Add pagination if lastKey is provided
+                  if (lastKey) {
+                      try {
+                          scanParams.ExclusiveStartKey = JSON.parse(decodeURIComponent(lastKey));
+                      } catch (error) {
+                          console.error('Error parsing lastKey:', error);
+                          return {
+                              statusCode: 400,
+                              headers: corsHeaders,
+                              body: JSON.stringify({
+                                  error: 'Invalid pagination key',
+                                  message: 'lastKey parameter is malformed'
+                              })
+                          };
+                      }
+                  }
+                  
+                  // Build filter expressions
+                  let filterExpressions = [];
+                  let expressionAttributeValues = {};
+                  let expressionAttributeNames = {};
+                  
+                  if (status && (status === 'active' || status === 'inactive')) {
+                      filterExpressions.push('#status = :status');
+                      expressionAttributeNames['#status'] = 'status';
+                      expressionAttributeValues[':status'] = status;
+                  }
+                  
+                  if (userName) {
+                      filterExpressions.push('contains(#userName, :userName)');
+                      expressionAttributeNames['#userName'] = 'userName';
+                      expressionAttributeValues[':userName'] = userName;
+                  }
+                  
+                  // Add filter expression if any filters are applied
+                  if (filterExpressions.length > 0) {
+                      scanParams.FilterExpression = filterExpressions.join(' AND ');
+                      scanParams.ExpressionAttributeNames = expressionAttributeNames;
+                      scanParams.ExpressionAttributeValues = expressionAttributeValues;
+                  }
+                  
+                  console.log('Scan parameters:', JSON.stringify(scanParams, null, 2));
+                  
+                  // Perform the scan operation
+                  const command = new ScanCommand(scanParams);
+                  const result = await dynamodb.send(command);
+                  
+                  console.log(`Retrieved ${result.Items.length} tasks`);
+                  
+                  // Sort tasks by createdAt in descending order (newest first)
+                  const sortedTasks = result.Items.sort((a, b) => 
                       new Date(b.createdAt) - new Date(a.createdAt)
                   );
+                  
+                  // Prepare pagination info
+                  let nextKey = null;
+                  if (result.LastEvaluatedKey) {
+                      nextKey = encodeURIComponent(JSON.stringify(result.LastEvaluatedKey));
+                  }
+                  
+                  // Return successful response
                   return {
                       statusCode: 200,
                       headers: corsHeaders,
                       body: JSON.stringify({
                           tasks: sortedTasks,
-                          count: sortedTasks.length
+                          count: sortedTasks.length,
+                          pagination: {
+                              nextKey: nextKey,
+                              hasMore: !!result.LastEvaluatedKey
+                          },
+                          filters: {
+                              status: status || null,
+                              userName: userName || null
+                          }
                       })
                   };
+                  
               } catch (error) {
-                  console.error('Error:', error);
+                  console.error('Error in fetcher function:', error);
+                  
+                  // Handle AWS service errors
+                  if (error.name === 'ResourceNotFoundException') {
+                      return {
+                          statusCode: 404,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Table not found',
+                              message: 'The tasks table does not exist'
+                          })
+                      };
+                  }
+                  
+                  if (error.name === 'ValidationException') {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Validation error',
+                              message: error.message
+                          })
+                      };
+                  }
+                  
+                  // Handle other AWS errors
+                  if (error.name) {
+                      return {
+                          statusCode: 500,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'AWS Service Error',
+                              message: error.message,
+                              code: error.name
+                          })
+                      };
+                  }
+                  
+                  // Handle general errors
                   return {
                       statusCode: 500,
                       headers: corsHeaders,
-                      body: JSON.stringify({ error: 'Internal server error' })
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: 'Failed to fetch tasks'
+                      })
                   };
               }
           };
@@ -209,68 +477,253 @@ Resources:
           ENVIRONMENT: !Ref Environment
       Code:
         ZipFile: |
-          const AWS = require('aws-sdk');
-          const dynamodb = new AWS.DynamoDB.DocumentClient();
+          const { DynamoDBClient } = require('@aws-sdk/client-dynamodb');
+          const { DynamoDBDocumentClient, GetCommand, UpdateCommand, DeleteCommand } = require('@aws-sdk/lib-dynamodb');
+
+          // Initialize DynamoDB client
+          const client = new DynamoDBClient({});
+          const dynamodb = DynamoDBDocumentClient.from(client);
+
           exports.handler = async (event) => {
+              console.log('Event:', JSON.stringify(event, null, 2));
+              
+              // CORS headers
               const corsHeaders = {
                   'Access-Control-Allow-Origin': '*',
                   'Access-Control-Allow-Headers': 'Content-Type,Authorization',
                   'Access-Control-Allow-Methods': 'PUT,DELETE,OPTIONS'
               };
+              
+              // Handle preflight OPTIONS request
               if (event.httpMethod === 'OPTIONS') {
-                  return { statusCode: 200, headers: corsHeaders, body: '{}' };
+                  return {
+                      statusCode: 200,
+                      headers: corsHeaders,
+                      body: JSON.stringify({ message: 'CORS preflight handled' })
+                  };
               }
+              
               try {
+                  // Extract task ID from path parameters
                   const taskId = event.pathParameters?.id;
                   if (!taskId) {
                       return {
                           statusCode: 400,
                           headers: corsHeaders,
-                          body: JSON.stringify({ error: 'Missing task ID' })
+                          body: JSON.stringify({
+                              error: 'Missing task ID',
+                              message: 'Task ID is required in the URL path'
+                          })
                       };
                   }
+                  
+                  // DynamoDB table name
+                  const tableName = process.env.TASKS_TABLE || 'TasksTable';
+                  
+                  // Handle different HTTP methods
                   if (event.httpMethod === 'PUT') {
-                      const { status } = JSON.parse(event.body);
-                      if (status !== 'active' && status !== 'inactive') {
-                          return {
-                              statusCode: 400,
-                              headers: corsHeaders,
-                              body: JSON.stringify({ error: 'Invalid status' })
-                          };
-                      }
-                      const result = await dynamodb.update({
-                          TableName: process.env.TASKS_TABLE,
-                          Key: { id: taskId },
-                          UpdateExpression: 'SET #status = :status, #updatedAt = :updatedAt',
-                          ExpressionAttributeNames: { '#status': 'status', '#updatedAt': 'updatedAt' },
-                          ExpressionAttributeValues: { ':status': status, ':updatedAt': new Date().toISOString() },
-                          ReturnValues: 'ALL_NEW'
-                      }).promise();
-                      return {
-                          statusCode: 200,
-                          headers: corsHeaders,
-                          body: JSON.stringify({ message: 'Task updated', task: result.Attributes })
-                      };
+                      return await updateTaskStatus(tableName, taskId, event.body, corsHeaders);
                   } else if (event.httpMethod === 'DELETE') {
-                      await dynamodb.delete({
-                          TableName: process.env.TASKS_TABLE,
-                          Key: { id: taskId }
-                      }).promise();
+                      return await deleteTask(tableName, taskId, corsHeaders);
+                  } else {
                       return {
-                          statusCode: 200,
+                          statusCode: 405,
                           headers: corsHeaders,
-                          body: JSON.stringify({ message: 'Task deleted' })
+                          body: JSON.stringify({
+                              error: 'Method not allowed',
+                              message: 'Only PUT and DELETE methods are supported'
+                          })
                       };
                   }
+                  
               } catch (error) {
-                  console.error('Error:', error);
+                  console.error('Error in admin function:', error);
+                  
+                  // Handle general errors
                   return {
                       statusCode: 500,
                       headers: corsHeaders,
-                      body: JSON.stringify({ error: 'Internal server error' })
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: 'Failed to process request'
+                      })
                   };
               }
           };
+
+          // Function to update task status
+          async function updateTaskStatus(tableName, taskId, requestBody, corsHeaders) {
+              try {
+                  // Parse request body
+                  let body;
+                  try {
+                      body = JSON.parse(requestBody);
+                  } catch (parseError) {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Invalid JSON',
+                              message: 'Request body must be valid JSON'
+                          })
+                      };
+                  }
+                  
+                  const { status } = body;
+                  
+                  // Validate status value
+                  if (!status || (status !== 'active' && status !== 'inactive')) {
+                      return {
+                          statusCode: 400,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Invalid status',
+                              message: 'Status must be either "active" or "inactive"'
+                          })
+                      };
+                  }
+                  
+                  // First, check if the task exists
+                  const getCommand = new GetCommand({
+                      TableName: tableName,
+                      Key: { id: taskId }
+                  });
+                  
+                  const existingItem = await dynamodb.send(getCommand);
+                  
+                  if (!existingItem.Item) {
+                      return {
+                          statusCode: 404,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Task not found',
+                              message: `Task with ID ${taskId} does not exist`
+                          })
+                      };
+                  }
+                  
+                  // Update the task status
+                  const updateCommand = new UpdateCommand({
+                      TableName: tableName,
+                      Key: { id: taskId },
+                      UpdateExpression: 'SET #status = :status, #updatedAt = :updatedAt',
+                      ExpressionAttributeNames: {
+                          '#status': 'status',
+                          '#updatedAt': 'updatedAt'
+                      },
+                      ExpressionAttributeValues: {
+                          ':status': status,
+                          ':updatedAt': new Date().toISOString()
+                      },
+                      ReturnValues: 'ALL_NEW'
+                  });
+                  
+                  const result = await dynamodb.send(updateCommand);
+                  
+                  console.log(`Task ${taskId} status updated to ${status}`);
+                  
+                  return {
+                      statusCode: 200,
+                      headers: corsHeaders,
+                      body: JSON.stringify({
+                          message: 'Task status updated successfully',
+                          task: result.Attributes
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error updating task status:', error);
+                  
+                  if (error.name) {
+                      return {
+                          statusCode: 500,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'AWS Service Error',
+                              message: error.message,
+                              code: error.name
+                          })
+                      };
+                  }
+                  
+                  return {
+                      statusCode: 500,
+                      headers: corsHeaders,
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: 'Failed to update task status'
+                      })
+                  };
+              }
+          }
+
+          // Function to delete a task
+          async function deleteTask(tableName, taskId, corsHeaders) {
+              try {
+                  // First, check if the task exists
+                  const getCommand = new GetCommand({
+                      TableName: tableName,
+                      Key: { id: taskId }
+                  });
+                  
+                  const existingItem = await dynamodb.send(getCommand);
+                  
+                  if (!existingItem.Item) {
+                      return {
+                          statusCode: 404,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'Task not found',
+                              message: `Task with ID ${taskId} does not exist`
+                          })
+                      };
+                  }
+                  
+                  // Delete the task
+                  const deleteCommand = new DeleteCommand({
+                      TableName: tableName,
+                      Key: { id: taskId },
+                      ReturnValues: 'ALL_OLD'
+                  });
+                  
+                  const result = await dynamodb.send(deleteCommand);
+                  
+                  console.log(`Task ${taskId} deleted successfully`);
+                  
+                  return {
+                      statusCode: 200,
+                      headers: corsHeaders,
+                      body: JSON.stringify({
+                          message: 'Task deleted successfully',
+                          deletedTask: result.Attributes
+                      })
+                  };
+                  
+              } catch (error) {
+                  console.error('Error deleting task:', error);
+                  
+                  if (error.name) {
+                      return {
+                          statusCode: 500,
+                          headers: corsHeaders,
+                          body: JSON.stringify({
+                              error: 'AWS Service Error',
+                              message: error.message,
+                              code: error.name
+                          })
+                      };
+                  }
+                  
+                  return {
+                      statusCode: 500,
+                      headers: corsHeaders,
+                      body: JSON.stringify({
+                          error: 'Internal server error',
+                          message: 'Failed to delete task'
+                      })
+                  };
+              }
+          }
       Tags:
         - Key: Environment
           Value: !Ref Environment
@@ -458,6 +911,7 @@ Resources:
       Action: lambda:InvokeFunction
       Principal: apigateway.amazonaws.com
       SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${TaskManagerAPI}/*/*'
+
 
   # API Gateway Deployment
   ApiDeployment:
